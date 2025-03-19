@@ -1,6 +1,6 @@
 policy:
   - id: "default"
-    interface: "\\Device\\NPF_{9E53C34B-2164-4CEA-B5DE-57A3EC892050}"  # 修改为正确的网卡接口
+    interface: "\\Device\\NPF_{}"  # 修改为正确的网卡接口
     white_ips:
       - "127.0.0.1"
       - "192.168.1.1"
