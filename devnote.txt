@@ -1,0 +1,390 @@
+蜜罐 honeypot,功能如下。
+检测非监听端口的攻击数据包,然后发送到后端的日志服务器中,由日志服务器
+处理。
+监听高交互蜜罐的端口,将攻击流量转移到后端的高交互蜜罐中,转移时会将攻击
+者的来源 IP 附加在连接中。
+高交互蜜罐 Server,它提供了一些常见的服务,接受 Agent 转移过来的流量并从连接
+中取出攻击者的来源IP。
+Log Server, 后端日志服务器,它接收 Agent 与蜜罐高交互服务发送的攻击信息,方
+便进一步分析、报警。日志传输方式可以根据需求选择,此处选择了 HTTP,也可以
+选择 Log Agent 等其他方式。
+数据库,保存攻击信息,这里使用了 MongoDB
+管理端,用于对蜜罐 Agent 下发策略及查看对密罐的攻击记录。
+
+蜜罐 Agent 的作用是监听攻击者的攻击,负责转发低交互蜜罐数据与高交互蜜罐的请
+求,包括以下几个模块。
+策略加载与更新模块,策略的内容有高交互 Server 的转发规则和IP、端口的白名单,
+启动时会加载初始化策略。
+非监听端口的抓包模块,用来捕获攻击者的扫描或访问行为,不管服务器中此端口
+是否处于监听状态,只要攻击者触碰就可以检测到。
+高交互蜜罐的转发模块,根据规则将特定服务的流量转发到高交互蜜罐中。在数据
+转发的过程中会将攻击者的真实源 IP 附带到数据包中,方便蜜罐高交互服务直接获
+取到攻击者的真实源IP。
+• 蜜罐的攻击日志传输模块,蜜罐 Agent 不直接分析攻击数据,而是发送到后端的日志
+服务器中,由后端处理程序从日志中取出处理,判断是否为攻击、是否告警等。
+
+Agent 策略模块的实现
+Agent 的策略是以 YAML 文件组织的,启动时会加载并解析为 go struct 格式,方便在
+Agent中随时访问
+策略模块分为两个字段policy和service
+policy 表示白名单的配置,目前的配置为来源 IP 的白名单及 Agent 端口的白名单。
+service 表示高交互蜜罐服务的配置,字段分别为高交互服务的ID、名称、Agent 监听
+的端口,以及转发到后端的IP 与端口
+在解析 YAML 文件时使用的是 gopkg.in/yaml.v2 库,在解析时需要定义相应的struct
+type (
+	Policy struct {
+		Id           string   `json:"Id"`
+		WhiteIps     []string `json:"white_ips"`
+		WhitePorts   []string `json:"white_ports"`
+	}
+
+	BackendService struct {
+		Id          string `bson:"Id"`
+		ServiceName string `json:"service_name"`
+		LocalPort   int    `json:"local_port"`
+		BackendHost string `json:"backend_host"`
+		BackendPort int    `json:"backend_port"`
+	}
+
+	PolicyData struct {
+		Policy  []Policy         `json:"policy"`
+		Service []BackendService `json:"service"`
+	}
+)
+需要编写一个 LoadPolicy 函数,可以将 YAML 解析为 PolicyData struct,并保存到项目的全局变量 vars. PolicyData 中,之后需要使用时直接从 vars. PolicyData 中读取即可
+
+非监听端口数据采集模块的实现
+蜜罐 Agent 很重要的一个功能是获取非监听端口的访问数据,用来检测攻击者的扫描
+行为。
+非监听端口数据获取的功能是利用gopacket模块实现
+非监听端口的数据采集也是需要采集 TCP 的五元组信息,采集到TCP 的五元组数据后,
+通过日志传输模块直接发送到后端的日志服务器中,为了节省网络传输与存储成本,只采集
+每个TCP 连接的第一个包
+func processPacket(packet gopacket.Packet) {
+	ipLayer := packet.Layer(layers.LayerTypeIPv4)
+	if ipLayer != nil {
+		ip, ok := ipLayer.(*layers.IPv4)
+		if ok {
+			switch ip.Protocol {
+			case layers.IPProtocolTCP:
+				tcpLayer := packet.Layer(layers.LayerTypeTCP)
+				if tcpLayer != nil {
+					tcp, _ := tcpLayer.(*layers.TCP)
+
+					srcPort := SplitPortService(tcp.SrcPort.String())
+					dstPort := SplitPortService(tcp.DstPort.String())
+					isHttp := false
+
+					applicationLayer := packet.ApplicationLayer()
+					if applicationLayer != nil {
+						// Search for a string inside the payload
+						if strings.Contains(string(applicationLayer.Payload()), "HTTP") {
+							isHttp = true
+						}
+					}
+
+					connInfo := models.NewConnectionInfo("tcp", ip.SrcIP.String(), srcPort, ip.DstIP.String(), dstPort, isHttp)
+
+					go func(info *models.ConnectionInfo, ) {
+						if !IsInWhite(info) &&
+							!CheckSelfPacker(info) &&
+							(tcp.SYN && !tcp.ACK) {
+							err := SendPacker(info)
+							logger.Log.Debugf("[TCP] %v:%v -> %v:%v, err: %v", ip.SrcIP, tcp.SrcPort.String(),
+								ip.DstIP, tcp.DstPort.String(), err)
+						}
+					}(connInfo)
+				}
+			}
+		}
+	}
+}
+
+高交互蜜罐的转发模块的实现
+高交互蜜罐的转发模块用于将策略中定义的服务的流量转发到后端的高交互蜜罐中,进一步获取攻击者的行为数据。
+实现原理为本地监听相应的端口,再将这些端口连接的数据转发到后端的高交互服务中。因为直接与后端高交互服务通信的是蜜罐的 Agent,而不是攻击者,后端的高交互服务
+无法获取攻击者的真实 IP地址,无法定位到攻击者。所以蜜罐的 Agent 在转发数据时需要
+将获取到的攻击者的来源 IP 转化为十进制的表示方式,并插入数据包的最前面。
+后端的高交互 Server 可以直接从数据包的前4个字节中得到真实的攻击者的IP地址。
+以下为需要编写高交互蜜罐转发模块的入口函数,执行流程如下。
+从 vars. PolicyData. service 中获取到需要转发的规则。
+通过循环以并发的形式监听这些端口,如果监听到新连接,会通过两个函数分别进行数据转发和流量转发。
+将攻击者的连接转发到蜜罐的高交互蜜罐中,在数据转发时,会将攻击者的真实IP 插入数据包的最前面
+
+日志传输模块的实现
+攻击日志的传输模块使用了 github.com/sirupsen/logrus 日志库,该日志库支持设置自定义
+的 hook,如支持向 Kafka、MongoBD、Fluentd、Redis、Scribe、Logbeat 及 MySQL 等写日志。
+这里自定义了一个http hook,用于实现将攻击日志通过 HTTP 发送到后端日志服务器的功能。
+type (
+HttpHook struct {
+HttpClient http. Client
+}
+)
+之后需要通过 http hook 向日志服务器发送攻击数据时,可以通过 With Field 指定目标
+API 地址,然后传入相应的 JSON 即可,详细的代码如下所示
+
+func SendPacker(connInfo * models. ConnectionInfo) (err error) {
+packetInfo := models. NewPacketInfo(connInfo, time. Now())
+jsonPacket, err : = packetInfo. String()
+if err! = nil {
+return err
+}
+go logger. LogReport. WithField("api", "/api/packet/"). Info(jsonPacket)
+return err
+}
+
+蜜罐的高交互服务用来处理蜜罐 Agent 转发过来的流量,并将攻击者的行为通过日志上
+报功能发送到日志服务器。
+蜜罐高交互服务由以下几个模块组成。
+反向代理模块,负责接收来自Agent 的连接,从中取出真实的攻击者 IP后,再将连
+接转发到蜜罐虚拟服务中。
+蜜罐的服务模块,笔者在配套的代码中提供了 SSH、MySQL、Redis 与MySQL 服务的
+实现。
+• 攻击日志传输模块,将攻击者对高交互服务的攻击日志传输到后端的日志服务器中。
+
+反向代理服务的实现
+反向代理模块在启动时会启动 SSH、Redis、Web 与MySQL 的代理,从中取出攻击者的
+真实IP后,再将流量转向后端的服务中。
+反向代理模块、后端服务的地址定义,以及反向代理启动的详细代码如下
+var(
+sshLocalAddr = fmt. Sprintf("%v:8022", vars. Config. Proxy. Addr)
+sshBackendAddr = "127.0. 0. 1:2222"
+mysqlLocalAddr = fmt. Sprintf("%v:3306", vars. Config. Proxy. Addr)
+mysqlBackendAddr = "127. 0.0.1:3366"
+redisLocalAddr = fmt. Sprintf("% v:6379", vars. Config. Proxy. Addr)
+redisBackendAddr = "127.0. 0.1:6380"
+webLocalAddr = fmt. Sprintf("% v:8080", vars. Config. Proxy. Addr)
+webBackendAddr = "127. 0. 0.1:8000"
+)
+
+// 再添加一个反向代理,用于获取以下高交互服务的真实源 IP
+func StartProxy() {
+// SSH的代理
+go serveProxy (sshLocalAddr, sshBackendAddr)
+//Redis 的代理
+go serveProxy (redisLocalAddr, redisBackendAddr)
+// Web 的代理
+go serveProxy (webLocalAddr, webBackendAddr)
+// MySQL 的代理
+go serveProxy (mysqlLocalAddr, mysqlBackendAddr)
+}
+for {
+time. Sleep(10 * time. Second)
+util. DelExpireIps (300)}
+
+以上代码中,先以协程的方式启动了SSH、Redis、Web 与MySQL 的反向代理服务,后
+面的循环是为了主协程一直执行不退出,其中的 util. DelExpirelps (300) 函数表示定期清理
+超过300 的攻击者的真实来源 IP,目的是防止服务运行太久不重启,被攻击者的来源 IP 占
+用大量内存。
+
+反向代理的主要逻辑需要编写两个函数实现
+handlePipe 函数会取出每个连接中攻击者的真实IP地址,并保存到项目的全局变量vars. Rawlps 中, vars. Rawlps 的数据类型为 sync. Map,是一个并发安全的Map。
+serveProxy 函数会根据传入的参数,启动一个有流量转发功能的反向代理。
+每个连接进来后都会在vars. RawIps 中保存攻击者的来源 IP, sync. Map 会随时间增长而
+越来越大,可能会造成服务器内存不足,所以需要定期清理过期的地址列表
+
+这个蜜罐高交互服务的示例提供了SSH、Redis、Web 与MySQL 的服务。之后会再进行这几种服务的的具体开发
+
+SSH 服务是用 github.com/gliderlabs/ssh 包实现的,这里封装了一个 StartSsh 函数,传入
+地址与 flag 两个参数即可启动
+安全起见,这里没有提供交互式的 shell,只允许攻击者进行
+口令破解,在破解的过程中,会记录攻击者的真实 IP与使用到的口令。
+flag 用来表示攻击连接的上游是否为蜜罐的反向代理,如果为反向代理,则设计使用一个
+util. GetRawlp 函数从 vars. Rawlps 中获取真实的IP地址,并将攻击日志格式化为一个统一的
+JSON 字符串发送到日志服务器中。
+util. GetRawlp 与util.GetRawIpByConn 是公共的函数,通过 net. conn、remote Addr 和 lo-calAddr 等参数直接获取攻击者的真实来源 IP。
+如果攻击连接的上游为密罐的反向代理,则可以从 vars. Rawlps 这个 sync. map 中取值,
+取值的 key 为fmt. Sprintf("% v_% v", remote Addr, localAddr),然后再根据分隔符将需要的
+字段取出,
+
+MySQL 服务的实现
+MySQL 服务是通过 https://github.com/src-d/go-mysql-server 包实现的。
+go-mysql-server 是一个 SQL 引擎,能解析标准 SQL(基于 MySQL 语法)并优化查询。它
+提供了简单的接口,允许自定义表格数据源实现,提供与MySQL 协议兼容的服务器实现,
+这意味着它与 MySQL ODBC、JDBC 或默认的MySQL 客户端 shell 接口兼容。
+编写代码可以实现一个简单的 MySQL 服务器,数据库服务器的连接账户、密码为
+root 与123456,数据库名与表名分别为 my_db 与my table。
+当然也可以为了迷惑攻击者多加几个数据库与数据表。
+通过这个代码实现一个了仿真性非常高的 MySQL 服务了,但目前还拿不到真实的攻击者IP,也无法实时向蜜罐的log 服务器上报攻击信息。
+这里可以采用了一个低成本的方法实现了获取攻击者真实 IP 与实时上报攻击数据的功能,
+即修改 go-mysql-server 依赖的 https://github.com/vitessio/vitess 库,但直接修改本地的库的
+方式不具备迁移性,更换编译环境就不能使用了,需要手工再修改本地的包。为了解决移植的问题,这里复制了 go-mysql-server库,新的仓库地址如下。
+https: //github. com/xsec-lab/go-mysql-server.
+这里采用的包管理方式为 Go Module,为了方便编译给 github.com/xsec-lab/go-mysqlserver 的对应版本打了标签, Github 打标签的方法如下
+git tag v1.0. 10
+git push-tag
+MySQL 高交互蜜罐服务最终配套版本的标签分别如下所示。
+github. com/xsec-lab/go-mysql-server vO. 8. 12-fina
+之后编译 MySQL 服务时,通过go mod tidy 命令可以自动获取正确的包。
+
+
+采用了一个低成本的方法实现了获取攻击者真实 IP 与实时上报攻击数据的功能,
+即修改 go-mysql-server 依赖的 https://github.com/vitessio/vitess 库,但直接修改本地的库的
+方式不具备迁移性,更换编译环境就不能使用了,需要手工再修改本地的包。为了解决移植
+的问题,这里分别复制了 go-mysql-server 与vitessio/vitess 库,新的仓库地址如下。
+https: //github. com/xsec-lab/vitess
+https: //github. com/xsec-lab/go-mysql-server.
+在xsec-lab/vitess 中进行了两处修改。
+在github.com/xsec-lab/vitess/go/mysql/server.go 文件中加入以下代码
+	if vars.Flag {
+		rawIp, ProxyAddr, timeStamp := util.GetRawIpByConn(conn)
+		logger.Log.Warningf("rawIp: %v, proxyAddr: %v, timestamp: %v", rawIp, ProxyAddr, timeStamp)
+		var message services.HoneypotMessage
+		message.Timestamp = timeStamp
+		message.RawIp = rawIp
+		message.ProxyAddr = ProxyAddr.String()
+
+		strMessage, _ := message.Build()
+		logger.Log.Info(strMessage)
+		_ = message.Send()
+	}
+以上代码的作用是获取到真实攻击者的来源 IP等,然后生成统一的JSON 格式发送到
+log 服务器中。
+在github.com/xsec-lab/vitess/go/mysql/conn. go 中加入以下代码
+		if vars.Flag {
+				rawIp, ProxyAddr, timeStamp := util.GetRawIpByConn(c.conn)
+				logger.Log.Warningf("rawIp: %v, proxyAddr: %v, timestamp: %v, query: %v, result: %v",
+					rawIp, ProxyAddr, timeStamp, query, qr.Rows)
+
+				var message services.HoneypotMessage
+				message.Timestamp = timeStamp
+				message.RawIp = rawIp
+				message.ProxyAddr = ProxyAddr.String()
+
+				d := make(map[string]interface{})
+				d["query"] = query
+				d["result"] = qr.Rows
+				message.Data = d
+
+				strMessage, _ := message.Build()
+				logger.Log.Info(strMessage)
+				_ = message.Send()
+			}
+
+以上代码的作用是获取攻击者的真实IP、查询命令与返回结果,并生成统一的JSON 格
+式发送到 Log 服务器中。
+这里采用的包管理方式为 Go Module,为了方便编译给 github.com/xsec-lab/go-mysqlserver 与github.com/xsec-lab/vitess 包的对应版本打了标签, Github 打标签的方法如下
+git tag v1.0. 10
+git push-tag
+MySQL 高交互蜜罐服务最终配套版本的标签分别如下所示。
+github. com/xsec-lab/go-mysql-server vO. 8. 12-fina
+github. com/xsec-lab/vitess v1.0.1
+之后编译 MySQL 服务时,通过go mod tidy 命令可以自动获取正确的包。
+
+
+Redis 服务是指过 github.com/redis-go/redcon 包实现的,通过以下代码可以实现一个仿真度极高的 Redis 服务器。
+func StartRedis(addr string, flag bool) error {
+	logger.Log.Warningf("start redis service on %v", addr)
+	err := redis.Run(addr, flag)
+	return err
+}
+这里直接在本地导入了github.com/redis-go/redcon 包，通过修改 Redis 对象的 Run 方法就可以实现攻击者来源 IP、命令等记录的获取并上报的功能
+详细的代码如下所示
+func (r *Redis) Run(addr string, flag bool) error {
+	go r.KeyExpirer().Start(100*time.Millisecond, 20, 25)
+	return redcon.ListenAndServe(
+		addr,
+		func(conn redcon.Conn, cmd redcon.Command) {
+			if flag {
+				rawIp, ProxyAddr, timeStamp := util.GetRawIpByConn(conn.NetConn())
+				tmpCmd := make([]string, 0)
+				for _, c := range cmd.Args {
+					tmpCmd = append(tmpCmd, string(c))
+				}
+
+				var message pusher.HoneypotMessage
+				message.Timestamp = timeStamp
+				message.RawIp = rawIp
+				message.ProxyAddr = ProxyAddr.String()
+				message.ServiceType = "redis"
+
+				data := make(map[string]interface{})
+				data["cmd"] = strings.Join(tmpCmd, " ")
+				message.Data = data
+
+				strMessage, _ := message.Build()
+				logger.Log.Info(strMessage)
+				_ = message.Send()
+			}
+
+			r.HandlerFn()(r.NewClient(conn), cmd)
+		},
+		func(conn redcon.Conn) bool {
+			return r.AcceptFn()(r.NewClient(conn))
+		},
+		func(conn redcon.Conn, err error) {
+			r.OnCloseFn()(r.NewClient(conn), err)
+		},
+	)
+}
+
+高交互蜜罐的 Web 服务是基于 Go 语言的 Gin 框架开发的,通过以下代码就可以启动一
+个HTTP服务。
+func Flagger(flag bool) gin.HandlerFunc {
+	return func(ctx *gin.Context) {
+		ctx.Set("flag", flag)
+		ctx.Next()
+	}
+}
+
+func StartWeb(addr string, flag bool) error {
+	// gin.SetMode(gin.ReleaseMode)
+
+	r := gin.Default()
+	r.Use(Flagger(flag))
+
+	r.Any("/", routers.IndexHandle)
+	err := r.Run(addr)
+	return err
+}
+
+
+以下代码可以完成获取攻击者的真实源 IP、请求的 body 等信息,格式化为JSON 后发
+送到log 服务器。
+var httpAddr = "127.0.0.1:8000"
+
+func IndexHandle(ctx *gin.Context) {
+	_, ok := ctx.Get("flag")
+	_ = ctx.Request.ParseForm()
+	params := ctx.Request.Form
+
+	remoteAddr := ctx.Request.RemoteAddr
+	host := ctx.Request.Host
+
+	body := make([]byte, 0)
+	n, err := ctx.Request.Body.Read(body)
+	logger.Log.Infof("n: %v, err: %v", n, err)
+	if ok {
+		rawIp, ProxyAddr, timeStamp := util.GetRawIp(remoteAddr, httpAddr)
+		logger.Log.Warnf("rawIp: %v, proxyAddr: %v, timestamp: %v", rawIp, ProxyAddr, timeStamp)
+		var message pusher.HoneypotMessage
+		message.Timestamp = timeStamp
+		message.RawIp = rawIp
+		message.ProxyAddr = ProxyAddr.String()
+
+		data := make(map[string]interface{})
+		data["body"] = body
+
+		message.Data = data
+		strMessage, _ := message.Build()
+		logger.Log.Info(strMessage)
+		_ = message.Send()
+	}
+
+	ctx.String(http.StatusOK, fmt.Sprintf("Hello, World! \nremote_addr: %v, host: %v, param: %v, body: %v\n",
+		remoteAddr, host, params, string(body)))
+}
+以上两端代码都为示例参考代码，请你根据我们代码的特征整合起来
+
+日志服务器
+日志服务器的的作用是接收蜜罐 Agent 与蜜罐 Server 发送的日志信息,以及实时判断是
+否为攻击并实时报警。
+通过 HTTP 的方式接收日志的,并将日志存储到
+MongoDB 中
+日志服务器的示例也是采用 Gin 开发的,实现了接收TCP 五元组包与高交互蜜罐的数据
+包的两个接口
+每个接口的实现过程都是类似的,流程如下。
+1) 获取 Agent 或高交互蜜罐发送的数据。
+2)判断 API 的 key 是否合法。
+3)如果请求合法,则将 JSON 转化为 Go 语言的 struct,然后保存到 MongoDB 中。
+以下为处理高交互蜜罐提交的数据的代码

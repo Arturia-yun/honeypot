@@ -1,0 +1,30 @@
+proxy:
+  addr: "127.0.0.1"
+
+api:
+  key: honeypot-api-key-2024
+  log_server: http://127.0.0.1:8083
+
+services:
+  ssh:
+    name: "SSH Service"
+    listen_addr: "127.0.0.1:2223"
+    backend_port: 2223
+    
+  mysql:
+    name: "MySQL Service"
+    listen_addr: "127.0.0.1:3366"
+    backend_port: 3367
+    credentials:
+      username: "root"
+      password: "123456"
+    
+  redis:
+    name: "Redis Service"
+    listen_addr: "127.0.0.1:6380"
+    backend_port: 6381
+    
+  web:
+    name: "Web Service"
+    listen_addr: "127.0.0.1:8081"
+    backend_port: 8082
