@@ -64,6 +64,11 @@ go run main.go
 ```
 ### 效果展示
 
+![image](https://github.com/user-attachments/assets/5a30b544-ddd3-4ad4-8c52-8d7da406494b)
+LogServer接受到MySQL和普通访问流量
+
+![image](https://github.com/user-attachments/assets/64b4132f-2113-4ada-8df7-f133e8794258)
+![image](https://github.com/user-attachments/assets/985e7b1d-d55d-4a4e-aac9-05ea0c67c9bd)
 
 
 ## 配置说明
@@ -292,8 +297,11 @@ go run main.go
 ```
 
 ### Effect display
+![image](https://github.com/user-attachments/assets/d5e94654-8c6d-417b-a495-0c0d5693b7da)
 
-
+LogServer receives MySQL and normal access traffic
+![image](https://github.com/user-attachments/assets/e9cefcae-d1de-43d7-bb8f-aa04eb63658b)
+![image](https://github.com/user-attachments/assets/2aefd001-a923-4e3b-a732-3ee9e59a79c2)
 
 ## Configuration
 
