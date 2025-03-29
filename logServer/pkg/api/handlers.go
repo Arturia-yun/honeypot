@@ -1,13 +1,14 @@
 package api
 
 import (
-    "context"
-    "honeypot/logServer/pkg/db"
-    "honeypot/logServer/pkg/models"
-    "github.com/gin-gonic/gin"
-    "time"
-    "fmt"
+	"context"
+	"encoding/json"
+	"fmt"
+	"honeypot/logServer/pkg/db"
+	"honeypot/logServer/pkg/models"
+	"time"
 
+	"github.com/gin-gonic/gin"
 )
 
 func HandlePacketLog(c *gin.Context) {
@@ -50,12 +51,49 @@ func HandleServiceLog(c *gin.Context) {
         return
     }
 
-    // 添加服务类型标识
-    logData["service_type"] = serviceType
+    // 创建一个新的文档，用于存储到MongoDB
+    newDocument := make(map[string]interface{})
+    
+    // 复制service_type字段
+    newDocument["service_type"] = serviceType
+    
+    // 如果有message字段且是字符串，尝试解析为JSON
+    if message, ok := logData["message"]; ok {
+        if msgStr, isStr := message.(string); isStr {
+            // 打印接收到的消息，用于调试
+            fmt.Printf("接收到的消息: %s\n", msgStr)
+            
+            // 尝试将message解析为JSON对象
+            var msgData map[string]interface{}
+            if err := json.Unmarshal([]byte(msgStr), &msgData); err == nil {
+                // 成功解析，将所有字段添加到新文档
+                for k, v := range msgData {
+                    newDocument[k] = v
+                }
+                fmt.Printf("成功解析JSON: %+v\n", msgData)
+            } else {
+                fmt.Printf("JSON解析错误: %v\n", err)
+                // 解析失败，保留原始message字段
+                newDocument["message"] = msgStr
+                // 添加解析错误信息，方便调试
+                newDocument["parse_error"] = err.Error()
+            }
+        } else {
+            // 如果message不是字符串，直接复制
+            newDocument["message"] = message
+        }
+    }
+    
+    // 复制其他字段
+    for k, v := range logData {
+        if k != "message" && k != "service_type" {
+            newDocument[k] = v
+        }
+    }
     
     // 存储到对应集合
     collectionName := serviceType + "_logs"
-    _, err := db.DB.Collection(collectionName).InsertOne(context.Background(), logData)
+    _, err := db.DB.Collection(collectionName).InsertOne(context.Background(), newDocument)
     if err != nil {
         c.JSON(500, gin.H{"error": err.Error()})
         return

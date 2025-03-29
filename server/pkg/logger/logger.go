@@ -25,3 +25,4 @@ func InitLogger() {
     httpHook := NewHttpHook("http://127.0.0.1:8083")
     LogReport.AddHook(httpHook)
 }
+

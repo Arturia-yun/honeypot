@@ -1,11 +1,13 @@
 package mysql
 
 import (
-    "honeypot/server/pkg/logger"
-    "honeypot/server/pkg/util"
-    "io"
-    "net"
-    "time"
+	"encoding/json"
+	"fmt"
+	"honeypot/server/pkg/logger"
+	"honeypot/server/pkg/util"
+	"io"
+	"net"
+	"time"
 )
 
 type MySQLProxy struct {
@@ -104,12 +106,14 @@ func (p *MySQLProxy) logConnection(conn net.Conn) {
         Event:   "connection",
     }
 
-    logger.LogReport.WithField("api", "/api/mysql/").Info(accessLog)
+    // 直接发送结构化日志
+    jsonData, err := json.Marshal(accessLog)
+    if err == nil {
+        logger.LogReport.WithField("api", "/api/mysql/").Info(string(jsonData))
+    }
 }
 
 func (p *MySQLProxy) logQuery(conn net.Conn, data []byte) {
-    // 这里可以添加MySQL协议解析逻辑，记录具体的查询语句
-    // 为了简单起见，这里只记录原始数据长度
     var attackerIP net.IP
     if p.isProxy {
         attackerIP = util.GetRawIpByConn(conn)
@@ -119,19 +123,34 @@ func (p *MySQLProxy) logQuery(conn net.Conn, data []byte) {
         }
     }
 
+    // 尝试解析MySQL查询命令
+    var queryCommand string
+    if len(data) > 5 {
+        // 简单解析，实际生产环境可能需要更复杂的解析
+        queryCommand = string(data[5:])
+    } else {
+        queryCommand = fmt.Sprintf("未知查询 (数据长度: %d)", len(data))
+    }
+
     queryLog := struct {
         Time     time.Time `json:"time"`
         IP       string    `json:"ip"`
         Service  string    `json:"service"`
         Event    string    `json:"event"`
+        Command  string    `json:"command"`
         DataLen  int       `json:"data_length"`
     }{
-        Time:    time.Now(),
-        IP:      attackerIP.String(),
-        Service: "mysql",
-        Event:   "query",
-        DataLen: len(data),
+        Time:     time.Now(),
+        IP:       attackerIP.String(),
+        Service:  "mysql",
+        Event:    "query",
+        Command:  queryCommand,
+        DataLen:  len(data),
     }
 
-    logger.LogReport.WithField("api", "/api/mysql/").Info(queryLog)
+    // 直接发送结构化日志
+    jsonData, err := json.Marshal(queryLog)
+    if err == nil {
+        logger.LogReport.WithField("api", "/api/mysql/").Info(string(jsonData))
+    }
 }

@@ -15,8 +15,9 @@ func StartSSHService(addr string, isProxy bool) error {
 }
 
 // StartMySQLService 启动MySQL服务
+// 在StartMySQLService函数中添加注释
 func StartMySQLService(addr string, isProxy bool) error {
-    logger.Log.Warningf("start mysql service on %v", addr)
+    logger.Log.Warningf("start mysql service on %v (includes file read vulnerability on port 3307)", addr)
     return mysql.StartMySQL(addr, isProxy)
 }
 
