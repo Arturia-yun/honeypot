@@ -1,6 +1,6 @@
 policy:
   - id: "default"
-    interface: "\\Device\\NPF_{9E53C34B-2164-4CEA-B5DE-57A3EC892050}"  # 修改为正确的网卡接口
+    interface: "\\Device\\NPF_{xxx}"  # 修改为正确的网卡接口
     white_ips:
       - "127.0.0.1"
       - "192.168.1.1"
@@ -18,13 +18,13 @@ service:
 
   - id: "mysql"
     service_name: "MySQL Service"
-    local_port: 3306        # 改回 3306
+    local_port: 3306       
     backend_host: "127.0.0.1"
     backend_port: 3366      # Server 监听 3366
 
   - id: "redis"
     service_name: "Redis Service"
-    local_port: 6379        # 改回 6379
+    local_port: 6379        
     backend_host: "127.0.0.1"
     backend_port: 6380      # Server 监听 6380
 
